@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "OpenCode — AI Browser Assistant",
+  "version": "0.1.0",
+  "description": "Chat with pages, delegate browser tasks, and research across sources with OpenCode Go.",
+  "minimum_chrome_version": "116",
+  "permissions": ["sidePanel", "activeTab", "scripting", "tabs", "storage", "downloads"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "OpenCode" },
+  "side_panel": { "default_path": "index.html" },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self';" }
+}
