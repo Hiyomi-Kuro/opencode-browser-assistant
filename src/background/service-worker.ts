@@ -10,6 +10,7 @@ import { PAGE_CHUNK_LENGTH } from '../core/agent/page-chunks';
 import { asOpenAiTools, isSafeHttpUrl, parseActionProtocol, TOOL_REGISTRY, validateToolArguments } from '../core/agent/tool-registry';
 import { SourceManager } from '../core/research/source-manager';
 import { buildResearchReport } from '../core/research/report-generator';
+import { appendPlannerToolCall, appendPlannerToolResult, trimPlannerHistory } from '../core/agent/planner-history';
 
 const STORE = { settings: 'settings', key: 'apiKey', chats: 'chats', tasks: 'tasks', calls: 'calls' } as const;
 const DEFAULT_SETTINGS: AppSettings = {
@@ -19,9 +20,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   reportLanguage: '简体中文', searchEngine: 'bing', chatTools: DEFAULT_CHAT_TOOLS,
 };
 const taskAbort = new Map<string, AgentRunControl>();
+const taskRuns = new Map<string, Promise<void>>();
 const liveTasks = new Map<string, TaskRecord>();
 const confirmationResolvers = new Map<string, (approved: boolean) => void>();
 const ownedTabs = new Map<string, Set<number>>();
+const deletedTaskIds = new Set<string>();
 const pageReadProgress = new Map<string, { nextOffset: number; totalLength: number; revision: number }>();
 const latestSnapshots = new Map<number, PageSnapshot & { elements?: Array<{ id: string; label: string; sensitive: boolean }>; forms?: unknown[]; readyState?: string }>();
 let apiDiagnosticInFlight = false;
@@ -115,14 +118,29 @@ async function completeToEnd(api: OpenCodeClient, mode: ApiCallRecord['mode'], s
   return { ...result, content };
 }
 async function saveTask(task: TaskRecord) {
+  if (deletedTaskIds.has(task.id)) return;
   const tasks = await allTasks(); const next = [task, ...tasks.filter((item) => item.id !== task.id)].slice(0, 40);
+  if (deletedTaskIds.has(task.id)) return;
   await chrome.storage.local.set({ [STORE.tasks]: next });
   try { chrome.runtime.sendMessage({ type: 'TASK_UPDATE', task }); } catch { /* no open panel */ }
 }
 
 async function bootstrap() {
-  const [settings, apiKey, tabs, chats, tasks, calls] = await Promise.all([getSettings(), getKey(), getTabs(), allChats(), allTasks(), allCalls()]);
+  const [settings, apiKey, tabs, chats, calls] = await Promise.all([getSettings(), getKey(), getTabs(), allChats(), allCalls()]);
+  const tasks = await reconcileInterruptedTasks();
   return { settings: publicSettings(settings), hasApiKey: !!apiKey, tabs: tabs.map(({ id, title, url, active }) => ({ id, title, url, active })), chats, tasks, calls };
+}
+
+async function reconcileInterruptedTasks() {
+  const tasks = await allTasks();
+  let changed = false;
+  const reconciled = tasks.map((task) => {
+    if (!['running', 'paused', 'awaiting-confirmation'].includes(task.status) || taskAbort.has(task.id)) return task;
+    changed = true;
+    return { ...task, status: 'stopped' as const, pendingConfirmation: undefined, error: '后台任务执行已中断，请新建任务后重试。', updatedAt: Date.now() };
+  });
+  if (changed) await chrome.storage.local.set({ [STORE.tasks]: reconciled });
+  return reconciled;
 }
 
 function safeError(error: unknown, apiKey = '') {
@@ -175,7 +193,7 @@ async function routeMessage(message: Record<string, unknown>): Promise<unknown> 
     case 'AGENT_START': return startTask('agent', String(message.task ?? ''), Number(message.tabId));
     case 'RESEARCH_START': return startTask('research', String(message.task ?? ''), Number(message.tabId));
     case 'TASK_CONTROL': return controlTask(String(message.taskId), String(message.action), message.approved === true);
-    case 'TASK_DELETE': { const id = String(message.taskId); const tasks = await allTasks(); await chrome.storage.local.set({ [STORE.tasks]: tasks.filter((task) => task.id !== id) }); return true; }
+    case 'TASK_DELETE': return deleteTaskRecord(String(message.taskId));
     default: throw new Error('Unsupported extension request.');
   }
 }
@@ -235,30 +253,60 @@ async function startTask(kind: 'agent' | 'research', prompt: string, requestedTa
   ownedTabs.set(taskId, ownTabs);
   const record: TaskRecord = { id: taskId, kind, task: prompt, sessionId: createSessionId(), status: 'running', steps: [], sources: [], startedAt: Date.now(), updatedAt: Date.now(), tabId };
   const runControl = new AgentRunControl(); taskAbort.set(taskId, runControl); liveTasks.set(taskId, record); await saveTask(record);
-  void runTask(record, settings, runControl.signal).catch(async (error: unknown) => {
+  const taskRun = runTask(record, settings, runControl.signal).catch(async (error: unknown) => {
     const latest = await findTask(taskId); if (!latest) return;
     latest.status = runControl.signal.aborted ? 'stopped' : 'failed';
     latest.error = runControl.signal.aborted ? undefined : safeError(error);
     latest.updatedAt = Date.now(); await saveTask(latest);
   }).finally(() => {
-    taskAbort.delete(taskId); liveTasks.delete(taskId); confirmationResolvers.delete(taskId);
+    taskAbort.delete(taskId); liveTasks.delete(taskId); confirmationResolvers.delete(taskId); deletedTaskIds.delete(taskId);
+    taskRuns.delete(taskId);
     for (const key of pageReadProgress.keys()) if (key.startsWith(`${taskId}:`)) pageReadProgress.delete(key);
   });
+  taskRuns.set(taskId, taskRun);
   return record;
 }
 
 async function findTask(id: string) { return (await allTasks()).find((task) => task.id === id); }
 async function controlTask(taskId: string, action: string, approved: boolean) {
   const task = liveTasks.get(taskId) ?? await findTask(taskId); if (!task) throw new Error('任务已不存在。');
-  if (action === 'stop') { const control = taskAbort.get(taskId); if (!control) throw new Error('任务已经结束。'); control.stop(); const resolve = confirmationResolvers.get(taskId); resolve?.(false); task.status = 'stopped'; task.updatedAt = Date.now(); await saveTask(task); return task; }
-  if (action === 'pause' && task.status === 'running') { const control = taskAbort.get(taskId); if (!control) throw new Error('任务已经结束。'); control.pause(); task.status = 'paused'; task.updatedAt = Date.now(); await saveTask(task); return task; }
+  if (action === 'stop') {
+    const control = taskAbort.get(taskId);
+    if (control) control.stop();
+    const resolve = confirmationResolvers.get(taskId); resolve?.(false);
+    task.status = 'stopped'; task.pendingConfirmation = undefined;
+    if (!control) task.error = '后台任务执行已中断，无法继续控制；请新建任务后重试。';
+    task.updatedAt = Date.now(); await saveTask(task); return task;
+  }
+  if (action === 'pause' && task.status === 'running') {
+    const control = taskAbort.get(taskId);
+    if (!control) {
+      task.status = 'stopped'; task.error = '后台任务执行已中断，无法暂停；请新建任务后重试。'; task.updatedAt = Date.now(); await saveTask(task); return task;
+    }
+    control.pause(); task.status = 'paused'; task.updatedAt = Date.now(); await saveTask(task); return task;
+  }
   if (action === 'resume') {
     const confirm = confirmationResolvers.get(taskId);
     if (task.pendingConfirmation && confirm) { task.pendingConfirmation = undefined; task.status = 'running'; confirmationResolvers.delete(taskId); confirm(approved); await saveTask(task); return task; }
-    const control = taskAbort.get(taskId); if (!control) throw new Error('任务的后台执行已结束，无法从此历史记录恢复。');
+    const control = taskAbort.get(taskId);
+    if (!control) { task.status = 'stopped'; task.pendingConfirmation = undefined; task.error = '后台任务执行已中断，无法恢复；请新建任务后重试。'; task.updatedAt = Date.now(); await saveTask(task); return task; }
     task.status = 'running'; task.updatedAt = Date.now(); control.resume(); await saveTask(task); return task;
   }
   throw new Error('此操作不适用于当前任务状态。');
+}
+
+async function deleteTaskRecord(taskId: string) {
+  const control = taskAbort.get(taskId);
+  if (control) {
+    deletedTaskIds.add(taskId);
+    control.stop();
+    confirmationResolvers.get(taskId)?.(false);
+    confirmationResolvers.delete(taskId);
+    await taskRuns.get(taskId);
+  }
+  const tasks = await allTasks();
+  await chrome.storage.local.set({ [STORE.tasks]: tasks.filter((task) => task.id !== taskId) });
+  return true;
 }
 
 async function pauseBoundary(task: TaskRecord, signal: AbortSignal) {
@@ -332,25 +380,26 @@ async function runTask(task: TaskRecord, settings: AppSettings, signal: AbortSig
       if (parsed?.kind === 'tool') action = { id: `json_${index}`, name: parsed.tool, arguments: parsed.arguments };
     }
     if (!action) { task.answer = response.content.trim() || '模型没有返回可执行操作或最终回答。'; break; }
+    appendPlannerToolCall(messages, action, toolsSupported);
     const validation = validateToolArguments(action.name, action.arguments);
     const step: TaskRecord['steps'][number] = { index, tool: action.name, arguments: action.arguments, status: validation.ok ? 'running' : 'error', at: Date.now() };
     task.steps.push(step); task.updatedAt = Date.now(); await saveTask(task);
-    if (!validation.ok) { step.status = 'error'; step.result = validation.error; messages.push(toolResult(action, validation.error)); await saveTask(task); continue; }
+    if (!validation.ok) { step.status = 'error'; step.result = validation.error; appendPlannerToolResult(messages, action, validation.error, toolsSupported); await saveTask(task); continue; }
     const element = typeof action.arguments.element_id === 'string' ? snapshot.elements?.find((item) => item.id === action.arguments.element_id) : undefined;
     const ownTabs = ownedTabs.get(task.id);
     const isOwnedTarget = action.name === 'browser.close_tab' ? ownTabs?.has(Number(action.arguments.tab_id)) : ownTabs?.has(tabId);
     const safetyAction = action.name === 'browser.click' && element?.label ? { ...action, arguments: { ...action.arguments, label: element.label } } : action;
     const assessment = assessAction(safetyAction, { confirmEveryAction: settings.confirmEveryAction, targetSensitive: element?.sensitive, agentOwnedTab: isOwnedTarget });
-    if (assessment.decision === 'deny') { step.status = 'blocked'; step.result = assessment.reason; messages.push(toolResult(action, `Blocked: ${assessment.reason}`)); await saveTask(task); continue; }
+    if (assessment.decision === 'deny') { step.status = 'blocked'; step.result = assessment.reason; appendPlannerToolResult(messages, action, `Blocked: ${assessment.reason}`, toolsSupported); await saveTask(task); continue; }
     if (assessment.decision === 'confirm' && !(await askConfirmation(task, action, assessment.reason, signal))) {
-      step.status = 'blocked'; step.result = 'User declined the confirmation.'; messages.push(toolResult(action, `Not approved. ${assessment.reason}`)); await saveTask(task); continue;
+      step.status = 'blocked'; step.result = 'User declined the confirmation.'; appendPlannerToolResult(messages, action, `Not approved. ${assessment.reason}`, toolsSupported); await saveTask(task); continue;
     }
     try {
+      await pauseBoundary(task, signal);
       const result = await executeTool(task, tabId, action, settings, sources, signal);
       step.status = 'done'; step.result = stringifyResult(result);
       if (['browser.new_tab', 'browser.switch_tab', 'browser.close_tab'].includes(action.name) && task.tabId) tabId = task.tabId;
-      messages.push({ role: 'assistant', content: null, tool_calls: [{ id: action.id, type: 'function', function: { name: action.name, arguments: JSON.stringify(action.arguments) } }] });
-      messages.push(toolResult(action, stringifyResult(result)));
+      appendPlannerToolResult(messages, action, stringifyResult(result), toolsSupported);
       if (['browser.extract_markdown', 'browser.extract_metadata', 'browser.read_page_chunk', 'browser.get_text'].includes(action.name)) {
         let sourceUrl = snapshot.url;
         if (action.name === 'browser.extract_markdown' || action.name === 'browser.extract_metadata') {
@@ -367,7 +416,7 @@ async function runTask(task: TaskRecord, settings: AppSettings, signal: AbortSig
         messages.push({ role: 'user', content: `Updated page state: ${untrustedPageBlock(JSON.stringify({ title: snapshot.title, url: snapshot.url, text: snapshot.text, textLength: snapshot.textLength, markdownLength: snapshot.markdownLength, links: snapshot.links.slice(0, 100), elements: snapshot.elements }))}\nUse browser.read_page_chunk to read more content in sections.` });
       }
       if (action.name === 'browser.extract_markdown') task.sources = sources.all();
-    } catch (error) { step.status = 'error'; step.result = safeError(error); messages.push(toolResult(action, `Tool failed: ${step.result}`)); }
+    } catch (error) { step.status = 'error'; step.result = safeError(error); appendPlannerToolResult(messages, action, `Tool failed: ${step.result}`, toolsSupported); }
     task.updatedAt = Date.now(); await saveTask(task);
   }
   if (!task.answer) task.answer = '任务已结束，但模型没有返回最终文本。';
@@ -378,13 +427,7 @@ async function runTask(task: TaskRecord, settings: AppSettings, signal: AbortSig
   task.status = 'completed'; task.updatedAt = Date.now(); await saveTask(task);
 }
 
-function toolResult(action: ToolCall, content: string): ChatTurn { const limit = 16000; return { role: 'tool', name: action.name, tool_call_id: action.id, content: content.length > limit ? `${content.slice(0, limit)}\n[…tool output truncated at ${limit} characters]` : content }; }
 function stringifyResult(value: unknown) { return typeof value === 'string' ? value : JSON.stringify(value); }
-function trimPlannerHistory(messages: ChatTurn[]) {
-  if (messages.length <= 28) return;
-  const prefix = messages.slice(0, 2); const recent = messages.slice(-26);
-  messages.splice(0, messages.length, ...prefix, ...recent);
-}
 function delay(ms: number, signal: AbortSignal) { return new Promise<void>((resolve, reject) => { const timer = setTimeout(resolve, ms); signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Stopped', 'AbortError')); }, { once: true }); }); }
 
 async function executeTool(task: TaskRecord, tabId: number, action: ToolCall, settings: AppSettings, sources: SourceManager, signal: AbortSignal): Promise<unknown> {

@@ -12,6 +12,7 @@ import { AgentRunControl } from '../src/core/agent/run-control';
 import { AGENT_SYSTEM_PROMPT, untrustedPageBlock } from '../src/core/agent/prompt-guard';
 import { SourceManager } from '../src/core/research/source-manager';
 import { buildResearchReport } from '../src/core/research/report-generator';
+import { appendPlannerToolCall, appendPlannerToolResult, trimPlannerHistory } from '../src/core/agent/planner-history';
 
 const config: AppSettings = {
   baseUrl: 'https://opencode.ai/inference/go/openai/v1', model: 'deepseek-v4.1-flash', maxTokens: 1024,
@@ -254,6 +255,45 @@ describe('OpenCode Go API', () => {
 });
 
 describe('sessions and guarded tools', () => {
+  it('keeps every retained tool result paired with its assistant call when trimming planner history', () => {
+    const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string | null; tool_calls?: unknown[]; tool_call_id?: string; name?: string }> = [
+      { role: 'system', content: 'system prompt' },
+      { role: 'user', content: 'task' },
+    ];
+    for (let index = 0; index < 12; index += 1) {
+      const action = { id: `call_${index}`, name: 'browser.get_page_info', arguments: {} };
+      appendPlannerToolCall(messages, action);
+      messages.push({ role: 'tool', name: action.name, tool_call_id: action.id, content: `result ${index}` });
+      messages.push({ role: 'user', content: `page update ${index}` });
+    }
+
+    trimPlannerHistory(messages, 10);
+
+    expect(messages.slice(0, 2).map(({ role }) => role)).toEqual(['system', 'user']);
+    expect(messages.length).toBeLessThanOrEqual(10);
+    for (const [index, message] of messages.entries()) {
+      if (message.role !== 'tool') continue;
+      const previous = messages[index - 1];
+      expect(previous?.role).toBe('assistant');
+      expect(previous?.tool_calls).toContainEqual(expect.objectContaining({ id: message.tool_call_id }));
+    }
+  });
+
+  it('uses ordinary assistant and user messages when native tool calls are unavailable', () => {
+    const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string | null; tool_calls?: unknown[]; tool_call_id?: string; name?: string }> = [
+      { role: 'system', content: 'system prompt' },
+      { role: 'user', content: 'task' },
+    ];
+    const action = { id: 'json_1', name: 'browser.get_page_info', arguments: {} };
+
+    appendPlannerToolCall(messages, action, false);
+    appendPlannerToolResult(messages, action, '{"ok":true}', false);
+
+    expect(messages.slice(2).map(({ role }) => role)).toEqual(['assistant', 'user']);
+    expect(messages[2]?.content).toContain('"action":"tool"');
+    expect(messages[3]?.content).toContain('Tool result for browser.get_page_info');
+  });
+
   it('reads long page content in bounded sections without truncating the total', () => {
     const page = 'x'.repeat(PAGE_CHUNK_LENGTH * 2 + 7);
     const first = slicePageChunk(page, 0);
